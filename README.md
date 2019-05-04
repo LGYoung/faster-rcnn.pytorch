@@ -2,7 +2,7 @@
 
 This is a repo for **reading source codes**. I add lots of comments **in Chinese**. If you want to know how to train faster-rcnn, please visit the original repo. If you have any confusion about the comments, welcome to contact with me.
 
-Note: The following words are copied from the original repo.
+Note: The following words are copied from the [original repo](https://github.com/jwyang/faster-rcnn.pytorch).
 
 ## Introduction
 
