@@ -27,6 +27,25 @@ try:
 except NameError:
     long = int  # Python 3
 
+'''
+    anchor_target_layer.py
+    将anchor boxes(没有经过任何操作的 没有经过网络模型预测值的)与ground truth boxes对比
+    对于每个anchor boxes 都计算出它和每个ground truth boxes 之间的IOU值 得到overlap
+    对于每个anchor boxes 遍历所有ground truth，找到它与所有ground truth最大的overlap值
+    得到   max_overlaps   shape [#anchor_boxes]
+    对于每个ground truth boxes 遍历所有的anchor boxes 找到它与所有anchor boxes最大的overlap 值
+    得到   gt_max_overlaps  shape [#gt_boxes]
+
+    选择出所有正样本：
+        (1)对于每个ground truth boxes 与它具有最大的overlap 的anchor boxes是正样本
+        (2)对于每个anchor boxes 只要它与任意的ground truth boxes之间的IOU值大于0.7
+    选择出正样本后 对所有前景正样本进行座标编码（generate good bounding boxes regression coefficients）
+    实际上代码实现的时候 是对图像中的每个anchor boxes都分配了ground truth boxes值 无论最后anchor boxes被分为正样本
+    还是负样本 anchor boxes与哪个gt boxes的overlap最大 就认为它是哪个gt boxes 的正样本 然后进行位置编码
+
+    所有overlap 小于0.3的anchor记作负样本
+'''
+
 # Anchor_target_layer作用是将anchors与GT联系在一起，生成标签和bbox regression的目标
 class _AnchorTargetLayer(nn.Module):
     """
@@ -53,6 +72,8 @@ class _AnchorTargetLayer(nn.Module):
         #   apply predicted bbox deltas at cell i to each of the 9 anchors
         # filter out-of-image anchors
 
+        # gt_boxes维度[batch_size, 20, 5] 为什么会是20呢 请看config.py中的MAX_NUM_GT_BOXES参数
+        # im_info维度[batch_size, 3]  3表示(h, w, scale)——scale是最小边resize到600的需要乘的系数
         # rpn_cls_score的维度[N, 2*9, H, W]
         rpn_cls_score = input[0]
         gt_boxes = input[1]
@@ -102,7 +123,7 @@ class _AnchorTargetLayer(nn.Module):
         labels = gt_boxes.new(batch_size, inds_inside.size(0)).fill_(-1)
         bbox_inside_weights = gt_boxes.new(batch_size, inds_inside.size(0)).zero_()
         bbox_outside_weights = gt_boxes.new(batch_size, inds_inside.size(0)).zero_()
-        # 返回overlaps的维度[B，N，K] 表示B个batchsize，N表示内部anchor总数，K表示gt的个数
+        # 返回overlaps的维度[B，N，K]
         overlaps = bbox_overlaps_batch(anchors, gt_boxes)
         # 求每一个anchor 与哪个 gts 的交并比最大的那个 以及 indices
         # 返回的维度为[B, N]
@@ -124,31 +145,48 @@ class _AnchorTargetLayer(nn.Module):
             labels[keep>0] = 1
 
         # fg label: above threshold IOU
+        # 对于那些和 所有gt的交并比 大于阈值(IoU>0.7)的anchors而言 它们的label就为1
         labels[max_overlaps >= cfg.TRAIN.RPN_POSITIVE_OVERLAP] = 1
-
+        # 这个参数就是看positive与negative谁比较强，先设置0说明positive强，因为0可能转1,而后设置0说明negative强，设置完1还可以设置成0
+        # 默认为positive强 所以它默认为False
         if cfg.TRAIN.RPN_CLOBBER_POSITIVES:
             labels[max_overlaps < cfg.TRAIN.RPN_NEGATIVE_OVERLAP] = 0
-
+        # 在一个batch中 fg最大的数值(0.5 * 256)
         num_fg = int(cfg.TRAIN.RPN_FG_FRACTION * cfg.TRAIN.RPN_BATCHSIZE)
-
+        # 求batch中每张图片 fg 和 bg 的总数
         sum_fg = torch.sum((labels == 1).int(), 1)
         sum_bg = torch.sum((labels == 0).int(), 1)
 
+        
+        '''
+            训练RPN的batch size=256
+            表示计算RPN损失函数时前景/背景或正/负样本共计算256个anchor boxes的损失值
+            这个batch size并不体现在任何前向传播的操作中，只是表示RPN选择多少个样本计算损失 
+        
+            就是说，对于image_batch_size数量的输入图像前向传播到了RPN，
+            对于同一batch size的每一张图像都会生成相同数量，相同座标的anchor boxes
+            对于每一张图像就选择256个样本计算损失   
+            并不是在一个batch size 的anchor boxes中一起进行选择的
+        '''
+        # 对batch中的每一张图片进行操作
         for i in range(batch_size):
             # subsample positive labels if we have too many
+            # 如果一张图片中的正样本数大于256 * 0.5
             if sum_fg[i] > num_fg:
                 fg_inds = torch.nonzero(labels[i] == 1).view(-1)
                 # torch.randperm seems has a bug on multi-gpu setting that cause the segfault.
                 # See https://github.com/pytorch/pytorch/issues/1868 for more details.
                 # use numpy instead.
                 #rand_num = torch.randperm(fg_inds.size(0)).type_as(gt_boxes).long()
+                # 对fd_inds进行随机排列 然后对除了前128个 的所有fg 的labels设置为-1(don't care)
                 rand_num = torch.from_numpy(np.random.permutation(fg_inds.size(0))).type_as(gt_boxes).long()
                 disable_inds = fg_inds[rand_num[:fg_inds.size(0)-num_fg]]
                 labels[i][disable_inds] = -1
 
-#           num_bg = cfg.TRAIN.RPN_BATCHSIZE - sum_fg[i]
+            # num_bg = cfg.TRAIN.RPN_BATCHSIZE - sum_fg[i]
+            # 求一张图片中 bg 的最大数目
             num_bg = cfg.TRAIN.RPN_BATCHSIZE - torch.sum((labels == 1).int(), 1)[i]
-
+            # 同理
             # subsample negative labels if we have too many
             if sum_bg[i] > num_bg:
                 bg_inds = torch.nonzero(labels[i] == 0).view(-1)
